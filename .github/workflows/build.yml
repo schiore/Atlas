@@ -1,0 +1,265 @@
+
+name: GeoSite & GeoIP
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: checkout-geosite
+        uses: actions/checkout@v4
+        with:
+          repository: v2fly/domain-list-community
+          path: sources/domain-list-community
+
+      - name: checkout-geoip
+        uses: actions/checkout@v4
+        with:
+          repository: v2fly/geoip
+          path: sources/geoip
+
+      - name: setup-go-geosite
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sources/domain-list-community/go.mod
+          cache-dependency-path: sources/domain-list-community/go.sum
+
+      - name: setup-go-geoip
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sources/geoip/go.mod
+          cache-dependency-path: sources/geoip/go.sum
+
+      - name: set-variables
+        id: variables
+        shell: bash
+        run: |
+          echo "tag_name=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: prepare-directories
+        shell: bash
+        run: |
+          mkdir -p publish/xray
+          mkdir -p publish/shadowrocket/geosite
+          mkdir -p publish/shadowrocket/geoip
+
+      - name: build-geosite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd sources/domain-list-community
+
+          go mod download
+
+          go run ./ \
+            --outputname=geosite.dat \
+            --outputdir="$GITHUB_WORKSPACE/publish/xray" \
+            --exportlists=category-ads-all,private,category-ru
+
+          echo "Generated GeoSite files:"
+          find "$GITHUB_WORKSPACE/publish/xray" -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+
+          if [ ! -s "$GITHUB_WORKSPACE/publish/xray/geosite.dat" ]; then
+            echo "::error::geosite.dat was not generated"
+            exit 1
+          fi
+
+          for file in "$GITHUB_WORKSPACE"/publish/xray/*.txt; do
+            if [ -f "$file" ]; then
+              mv "$file" "$GITHUB_WORKSPACE/publish/shadowrocket/geosite/"
+            fi
+          done
+
+          echo "Generated Shadowrocket GeoSite lists:"
+          find "$GITHUB_WORKSPACE/publish/shadowrocket/geosite" -type f -printf '%f (%s bytes)\n' | sort
+
+      - name: get-dbip-version
+        id: dbip
+        shell: bash
+        run: |
+          ver=$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m)
+
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_ENV"
+
+      - name: cache-dbip
+        uses: actions/cache@v4
+        with:
+          path: sources/geoip/db-ip/dbip-country-lite.mmdb
+          key: dbip-${{ steps.dbip.outputs.ver }}
+
+      - name: download-dbip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p sources/geoip/db-ip
+
+          file="sources/geoip/db-ip/dbip-country-lite.mmdb"
+
+          if [ ! -s "$file" ]; then
+            url="https://download.db-ip.com/free/dbip-country-lite-${ver}.mmdb.gz"
+
+            curl -fL --retry 3 "$url" -o /tmp/dbip.mmdb.gz
+            gunzip -c /tmp/dbip.mmdb.gz > "$file"
+          fi
+
+          test -s "$file"
+
+      - name: configure-geoip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd sources/geoip
+
+          jq '
+            .input |= map(select(.type != "test")) |
+            .output = [
+              {
+                "type": "v2rayGeoIPDat",
+                "action": "output",
+                "args": {
+                  "outputName": "geoip.dat",
+                  "outputDir": "output/dat"
+                }
+              },
+              {
+                "type": "text",
+                "action": "output",
+                "args": {
+                  "outputDir": "output/text",
+                  "outputExtension": ".txt"
+                }
+              }
+            ]
+          ' config.json > config.json.tmp
+
+          mv config.json.tmp config.json
+
+          echo "GeoIP configuration:"
+          cat config.json
+
+      - name: build-geoip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd sources/geoip
+
+          go mod download
+
+          mkdir -p output/dat
+          mkdir -p output/text
+
+          go run ./
+
+          test -s output/dat/geoip.dat
+
+          cp output/dat/geoip.dat \
+            "$GITHUB_WORKSPACE/publish/xray/geoip.dat"
+
+          cp output/text/*.txt \
+            "$GITHUB_WORKSPACE/publish/shadowrocket/geoip/"
+
+          echo "Generated GeoIP files:"
+          find "$GITHUB_WORKSPACE/publish/shadowrocket/geoip" -type f -printf '%f (%s bytes)\n' | sort
+
+      - name: validate-output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generated files:"
+          find publish -type f -printf '%p (%s bytes)\n' | sort
+
+          test -s publish/xray/geosite.dat
+          test -s publish/xray/geoip.dat
+
+          test -s publish/shadowrocket/geosite/category-ads-all.txt
+          test -s publish/shadowrocket/geosite/private.txt
+          test -s publish/shadowrocket/geosite/category-ru.txt
+
+          test -s publish/shadowrocket/geoip/ru.txt
+          test -s publish/shadowrocket/geoip/private.txt
+
+          echo "All output files are valid."
+
+      - name: generate-checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd publish
+
+          find xray shadowrocket -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > sha256sums.txt
+
+      - name: create-archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd publish
+
+          zip -9 -qr "$GITHUB_WORKSPACE/xray.zip" xray
+          zip -9 -qr "$GITHUB_WORKSPACE/shadowrocket.zip" shadowrocket
+
+          cp sha256sums.txt "$GITHUB_WORKSPACE/sha256sums.txt"
+
+      - name: publish-release-branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/publish"
+
+          git init --initial-branch=release
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .
+          git commit -m "${{ steps.variables.outputs.tag_name }}"
+
+          git remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git push --force origin release
+
+      - name: publish-github-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.variables.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG_NAME" \
+            xray.zip \
+            shadowrocket.zip \
+            sha256sums.txt \
+            --title "$TAG_NAME" \
+            --notes "$TAG_NAME"
